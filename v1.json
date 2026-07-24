@@ -1,0 +1,64 @@
+{
+  "code": 1,
+  "message": "success",
+  "expires_in": 3600,
+  "readme": "当前版本太低，请到Github搜索duola下载新版",
+  "notice": "5qyi6L+O5YWJ5Li05Li76aG177yaaHR0cHM6Ly9tYWxpbWFsaWFvLmdpdGh1Yi5pby9rb2RpLw==",
+  "client": "1.7.0",
+  "data": {
+    "time": "2024-06-04 20:36:02",
+    "note": "",
+    "list": [
+      {
+        "name": "1.茅台资源",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9jYWlqaS5tYW90YWl6eS5jYy9hcGkucGhwL3Byb3ZpZGUvdm9kL2F0L2pvc24v"
+      },
+      {
+        "name": "2.非凡网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9hcGkuZmZ6eWFwaS5jb20vYXBpLnBocC9wcm92aWRlL3ZvZC8="
+      },
+      {
+        "name": "3.量子网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9jai5semlhcGkuY29tL2FwaS5waHAvcHJvdmlkZS92b2Qv"
+      },
+      {
+        "name": "4.皇后网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9oaHp5YXBpLmNvbS9hcGkucGhwL3Byb3ZpZGUvdm9kLw=="
+      },
+      {
+        "name": "5.光速网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9hcGkuZ3VhbmdzdWFwaS5jb20vYXBpLnBocC9wcm92aWRlL3ZvZC8="
+      },
+      {
+        "name": "6.金鹰网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9qeXp5YXBpLmNvbS9wcm92aWRlL3ZvZC9mcm9tL2ppbnlpbmdtM3U4L2F0L2pzb24="
+      },
+      {
+        "name": "7.天启网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly8zNjB6eS5jb20vYXBpLnBocC9wcm92aWRlL3ZvZC8="
+      },
+      {
+        "name": "8.樱花网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9tM3U4LmFwaXloenkuY29tL2FwaS5waHAvcHJvdmlkZS92b2Qv"
+      },
+      {
+        "name": "9.无极网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9hcGkud3VqaW5hcGkubWUvYXBpLnBocC9wcm92aWRlL3ZvZC8="
+      },
+      {
+        "name": "10.白度网络",
+        "status": 1,
+        "api_url": "aHR0cHM6Ly9hcGkuYXBpYmR6eS5jb20vYXBpLnBocC9wcm92aWRlL3ZvZC8="
+      }
+    ]
+  }
+}
