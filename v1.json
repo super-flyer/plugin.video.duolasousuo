@@ -20,11 +20,6 @@
         "api_url": "aHR0cHM6Ly9hcGkuZmZ6eWFwaS5jb20vYXBpLnBocC9wcm92aWRlL3ZvZC8="
       },
       {
-        "name": "3.量子网络",
-        "status": 1,
-        "api_url": "aHR0cHM6Ly9jai5semlhcGkuY29tL2FwaS5waHAvcHJvdmlkZS92b2Qv"
-      },
-      {
         "name": "4.皇后网络",
         "status": 1,
         "api_url": "aHR0cHM6Ly9oaHp5YXBpLmNvbS9hcGkucGhwL3Byb3ZpZGUvdm9kLw=="
@@ -48,16 +43,6 @@
         "name": "8.樱花网络",
         "status": 1,
         "api_url": "aHR0cHM6Ly9tM3U4LmFwaXloenkuY29tL2FwaS5waHAvcHJvdmlkZS92b2Qv"
-      },
-      {
-        "name": "9.无极网络",
-        "status": 1,
-        "api_url": "aHR0cHM6Ly9hcGkud3VqaW5hcGkubWUvYXBpLnBocC9wcm92aWRlL3ZvZC8="
-      },
-      {
-        "name": "10.白度网络",
-        "status": 1,
-        "api_url": "aHR0cHM6Ly9hcGkuYXBpYmR6eS5jb20vYXBpLnBocC9wcm92aWRlL3ZvZC8="
       }
     ]
   }
