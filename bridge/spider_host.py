@@ -166,6 +166,7 @@ class SpiderHost(object):
                     'p%d' % index, item.get('name') or item.get('file', 'py'),
                     self._path(item.get('file', '')), item.get('ext', '{}'),
                     timeout=cfg.get('timeout', 8), cwd=self.base_dir)
+                provider.base_url = item.get('base_url') or ''
                 self.providers[provider.id] = provider
 
         js_cfg = cfg.get('js') or {}
@@ -187,6 +188,8 @@ class SpiderHost(object):
                     item.get('class', ''), item.get('ext', '{}'), classpath,
                     java_bin=java_cfg.get('java_bin') or 'java',
                     timeout=cfg.get('timeout', 8), cwd=self.base_dir)
+                # v2.2: 播放页相对地址的补全基准（ext.site 缺失时的显式兜底）
+                provider.base_url = item.get('base_url') or ''
                 self.providers[provider.id] = provider
 
         # FongMi 配置里 csp_* 的 Android dex jar 需要 DexClassLoader，只登记

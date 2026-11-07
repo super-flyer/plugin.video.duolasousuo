@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""duola-bridge: FongMi/TVBox 配置 -> MACCMS JSON 适配服务（v2.0）。
+"""duola-bridge: FongMi/TVBox 配置 -> MACCMS JSON 适配服务（v2.2）。
 
 在家里的服务器（与 Kodi 同机）只监听 127.0.0.1，把多个 CMS 资源站聚合成
 标准 /api.php/provide/vod/ 接口，Kodi 插件的「额外搜索接口」直接填它即可。
@@ -9,6 +9,7 @@
   type 0/1 的 HTTP CMS 站点自动纳入；type 3 的 csp_*/js/py 需要 Spider Host，
   这里只统计并跳过，不假装能执行。
 - 搜索并发聚合 + 去重 + 上游死源冷却；详情按编码后的 vod_id 回源。
+- v2.2: 详情回源时补全间接播放地址（playerContent / 播放页抓取），写回 vod_play_url。
 - 不存储、不转发任何媒体内容，只做 JSON 转换。
 """
 import argparse
@@ -26,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spider_host as sh
+import play_resolver as pr
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -34,6 +36,7 @@ CFG = {}
 SOURCES = []
 STATS = {}
 SPIDER_HOST = None
+PLAY_RESOLVER = None
 HEALTH_LOCK = threading.Lock()
 HEALTH_PATH = os.path.expanduser('~/.local/share/duola-bridge/health.json')
 
@@ -287,10 +290,14 @@ def do_detail(token):
     source_id, vod_id = decoded
     if SPIDER_HOST and source_id in SPIDER_HOST.providers:
         items = SPIDER_HOST.detail(source_id, vod_id)
+        base = pr.provider_base(SPIDER_HOST, source_id)
+        resolved = 0
         for item in items:
             item['vod_id'] = token
+            if PLAY_RESOLVER:
+                resolved += PLAY_RESOLVER.complete(item, source_id, base=base)['resolved']
         return {'code': 1, 'msg': 'duola-bridge (spider)', 'list': items,
-                'total': len(items), 'page': 1, 'pagecount': 1}
+                'total': len(items), 'page': 1, 'pagecount': 1, 'resolved': resolved}
     source = next((s for s in SOURCES if s['id'] == source_id), None)
     if not source:
         return {'code': 0, 'msg': 'unknown source', 'list': []}
@@ -299,9 +306,22 @@ def do_detail(token):
     except Exception as e:
         return {'code': 0, 'msg': type(e).__name__, 'list': []}
     items = data.get('list') or []
+    resolved = 0
     for item in items:
         item['vod_id'] = token
-    return {'code': 1, 'msg': 'duola-bridge', 'list': items, 'total': len(items), 'page': 1, 'pagecount': 1}
+        if PLAY_RESOLVER:
+            resolved += PLAY_RESOLVER.complete(item, source_id, base=source['url'])['resolved']
+    return {'code': 1, 'msg': 'duola-bridge', 'list': items,
+            'total': len(items), 'page': 1, 'pagecount': 1, 'resolved': resolved}
+
+
+def do_resolve(source_id, flag, play_id, base=''):
+    """诊断端点：查看单个播放 id 的补全结果。"""
+    if not PLAY_RESOLVER:
+        return {'code': 0, 'msg': 'resolver not initialized'}
+    final, method = PLAY_RESOLVER.resolve_one(source_id, flag, play_id, base)
+    return {'code': 1, 'source': source_id, 'flag': flag, 'original': play_id,
+            'url': final, 'method': method, 'resolved': bool(final and final != play_id)}
 
 
 def do_play(provider_id, flag, play_id):
@@ -314,12 +334,13 @@ def do_play(provider_id, flag, play_id):
 def status_payload():
     health = health_load()
     return {
-        'code': 1, 'service': 'duola-bridge', 'version': '2.1.0',
+        'code': 1, 'service': 'duola-bridge', 'version': '2.2.0',
         'sources': [{'id': s['id'], 'name': s['name'], 'url': s['url'],
                      'cooling': is_cooling(s['url'], health, cooldown=int(CFG.get('cooldown', 1800)))}
                     for s in SOURCES],
         'stats': STATS,
         'spider': SPIDER_HOST.status() if SPIDER_HOST else {'enabled': False},
+        'play_resolver': PLAY_RESOLVER.status() if PLAY_RESOLVER else {'enabled': False},
     }
 
 
@@ -361,11 +382,16 @@ class Handler(BaseHTTPRequestHandler):
                                        (query.get('id') or [''])[0]))
         if action == 'spider_test':
             return self._reply(SPIDER_HOST.self_test() if SPIDER_HOST else {'ok': False, 'error': 'not initialized'})
+        if action == 'resolve':
+            return self._reply(do_resolve((query.get('provider') or [''])[0],
+                                          (query.get('flag') or [''])[0],
+                                          (query.get('id') or [''])[0],
+                                          (query.get('base') or [''])[0]))
         return self._reply(status_payload())
 
 
 def main():
-    global CFG, SOURCES, STATS, SPIDER_HOST
+    global CFG, SOURCES, STATS, SPIDER_HOST, PLAY_RESOLVER
     parser = argparse.ArgumentParser(description='duola-bridge (FongMi/CMS adapter)')
     parser.add_argument('--config', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sources.json'))
     args = parser.parse_args()
@@ -376,13 +402,15 @@ def main():
     host_cfg['spider_host'] = dict(CFG.get('spider_host') or {})
     host_cfg['spider_host']['dex_sites'] = STATS.get('spider_skipped', 0)
     SPIDER_HOST = sh.SpiderHost(host_cfg, base_dir=os.path.dirname(os.path.abspath(__file__)))
+    PLAY_RESOLVER = pr.PlayResolver(CFG.get('play_resolve'), spider_host=SPIDER_HOST)
     listen = CFG.get('listen', '127.0.0.1')
     port = int(CFG.get('port', 8765))
     server = ThreadingHTTPServer((listen, port), Handler)
     server.daemon_threads = True
-    print('[bridge] listening on %s:%d, cms_sources=%d, spider_providers=%d, dex_skipped=%d'
+    print('[bridge] listening on %s:%d, cms_sources=%d, spider_providers=%d, '
+          'dex_skipped=%d, play_resolve=%s'
           % (listen, port, len(SOURCES), len(SPIDER_HOST.providers),
-             STATS.get('spider_skipped', 0)), flush=True)
+             STATS.get('spider_skipped', 0), PLAY_RESOLVER.enabled), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

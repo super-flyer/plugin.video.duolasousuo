@@ -5,11 +5,24 @@
   "listen": "127.0.0.1",
   "port": 8765,
   "token": "",
-  "timeout": 5,
-  "deadline": 6,
-  "spider_budget": 8,
+  "timeout": 6,
+  "deadline": 8,
+  "spider_budget": 9,
   "max_workers": 8,
   "cooldown": 1800,
+  // v2.2 播放地址补全：对 .html 播放页 / 间接 id 做二级取址并写回 vod_play_url。
+  // 已是可播 m3u8/mp4 的分集不动；最多解析 40 集，整体预算 6s，结果缓存 10 分钟。
+  // 若 Spider 的 playerContent 返回 parse=1，可在此填解析接口前缀，例如
+  // "parse_url": "https://parse.example.com/?url="（留空则不处理，标记为不可播）。
+  "play_resolve": {
+    "enabled": true,
+    "max_workers": 8,
+    "max_episodes": 40,
+    "fetch_timeout": 3,
+    "budget": 8,
+    "cache_ttl": 600,
+    "parse_url": ""
+  },
   // FongMi/TVBox 配置（相对工作目录或绝对路径/URL）。
   // 其中 type 0/1 的 HTTP CMS 站点会自动并入源列表；type 3 的 spider 站点只统计、跳过。
   "fongmi_config": "fongmi_config.json",
@@ -18,7 +31,7 @@
   // Android dex 格式的 csp_*Guard 无法在 Linux JVM 运行，只统计不执行。
   "spider_host": {
     "enabled": true,
-    "timeout": 5,
+    "timeout": 8,
     "python": {
       "enabled": true,
       "spiders": [
@@ -29,13 +42,14 @@
     "java": {
       "enabled": true,
       "jar_dir": "jars",
-      // Bili 的 searchContent 需要有效 B 站 cookie（空 cookie 会被引擎风控返回非 JSON），
-      // 已从白名单移除；填了真实 cookie 后可自行加回。
-      // 下列类实测 searchContent 能返回结果，ext 取自 FongMi 配置。
+      // Bili 需有效 B 站 cookie；Wogg 详情无播放列表、SeedHub 详情异常；
+      // Zxzj 播放页虽能补全出真实地址，但其媒体域名对当前出口固定 403（与请求头无关）。
+      // 以上均已移出白名单，避免搜索结果混入必然打不开的条目。
+      // IkBot 实测直接给出 31 条线路的可播 m3u8，是当前唯一稳定可用的 Java Spider。
+      // 需要启用播放页补全的 Spider 时，可按下例登记 base_url：
+      // { "name": "Zxzj", "class": "Zxzj", "ext": "{}", "base_url": "https://www.zxzj.run/" }
       "classes": [
-        { "name": "Zxzj", "class": "Zxzj", "ext": "{}" },
-        { "name": "Wogg", "class": "Wogg", "ext": "{\"site\":[\"https://www.wogg.net\",\"https://www.wogg.live\"]}" },
-        { "name": "SeedHub", "class": "SeedHub", "ext": "{\"site\":[\"https://seedog.cc\",\"https://seedhub.pro\"]}" }
+        { "name": "IkBot", "class": "IkBot", "ext": "{}" }
       ]
     },
     "remote_spider_url": ""

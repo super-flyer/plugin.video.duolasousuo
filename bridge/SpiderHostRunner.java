@@ -84,9 +84,12 @@ public class SpiderHostRunner {
                 out = invoke(spider, "detailContent", new Class<?>[]{List.class},
                         new Object[]{Arrays.asList(args[3])});
             } else if ("play".equals(action)) {
-                out = invoke(spider, "playerContent",
-                        new Class<?>[]{String.class, String.class, List.class},
-                        new Object[]{args[3], args[4], Collections.emptyList()});
+                // 部分 Spider 只有两参重载；vipFlags 传空列表即可
+                out = invokeAny(spider, "playerContent",
+                        new Class<?>[][]{{String.class, String.class, List.class},
+                                {String.class, String.class}},
+                        new Object[][]{{args[3], args[4], Collections.emptyList()},
+                                {args[3], args[4]}});
             } else if ("home".equals(action)) {
                 out = invoke(spider, "homeVideoContent", new Class<?>[]{}, new Object[]{});
             } else {
@@ -95,7 +98,16 @@ public class SpiderHostRunner {
             data = (out == null || out.trim().isEmpty()) ? "{}" : out.trim();
         } catch (Throwable t) {
             ok = false;
-            error = t.toString();
+            // 反射包装会隐藏真正的异常，展开 InvocationTargetException 便于排查
+            Throwable real = t;
+            while ((real instanceof java.lang.reflect.InvocationTargetException
+                    || real instanceof java.lang.RuntimeException)
+                    && real.getCause() != null && real.getCause() != real) {
+                real = real.getCause();
+            }
+            error = real.toString();
+            StackTraceElement[] trace = real.getStackTrace();
+            if (trace.length > 0) error += " @ " + trace[0];
             data = "{}";
         }
         System.out.println("{\"ok\":" + ok + ",\"data\":\"" + escape(data)

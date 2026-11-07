@@ -35,7 +35,8 @@ class Spider(object):
             'vod_remarks': '本地示例',
             'vod_pic': '',
             'vod_play_from': 'demo',
-            'vod_play_url': '第01集$https://example.com/1.m3u8',
+            # 故意给间接 id，让自检链路覆盖 v2.2 的播放地址补全
+            'vod_play_url': '第01集$demo1',
             'vod_content': 'This item is generated locally by the demo spider.',
         }]}
 
