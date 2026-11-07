@@ -462,20 +462,46 @@ def is_indirect_play_url(url):
 
 
 def probe_play_url(url, timeout=None):
-    """轻量探测播放地址；返回 True 表示可尝试播放。"""
+    """v2.3: 探测播放地址；HEAD 被 CDN 拒绝时回退 GET Range。
+
+    实测部分 m3u8 CDN（如 svip.ryiplay18.com）HEAD 返回 404 但 GET 200，
+    只信 HEAD 会把真正可播的线路误标成 [不可用]。
+    """
     if not url:
         return False
     timeout = timeout or PLAYBACK_PROBE_TIMEOUT
+    clean, custom_headers = split_play_headers(url)
+    probe_headers = dict(UA_head)
+    probe_headers.update(custom_headers)
     try:
         head = getattr(requests, 'head', None)
-        clean, custom_headers = split_play_headers(url)
-        probe_headers = dict(UA_head)
-        probe_headers.update(custom_headers)
         if head:
             res = head(clean, headers=probe_headers, timeout=timeout, allow_redirects=True)
-            return res.status_code < 400 or res.status_code in (405, 501)
-        res = requests.get(clean, headers=probe_headers, timeout=timeout)
-        return res.status_code < 400
+            status = getattr(res, 'status_code', 0)
+            if status < 400 or status in (405, 501):
+                return True
+            if status not in (400, 403, 404):
+                return False
+        get_headers = dict(probe_headers)
+        get_headers['Range'] = 'bytes=0-1023'
+        res = requests.get(clean, headers=get_headers, timeout=timeout, stream=True)
+        status = getattr(res, 'status_code', 0)
+        if status >= 400 and status != 206:
+            return False
+        chunk = b''
+        try:
+            iterator = getattr(res, 'iter_content', None)
+            if iterator:
+                chunk = next(iterator(512), b'') or b''
+            else:
+                chunk = (getattr(res, 'content', b'') or b'')[:512]
+            res.close()
+        except Exception:
+            pass
+        head_bytes = (chunk or b'').lstrip()[:9].lower()
+        if head_bytes.startswith((b'<!doctype', b'<html')):
+            return False
+        return True
     except requests.exceptions.RequestException:
         return False
     except Exception:

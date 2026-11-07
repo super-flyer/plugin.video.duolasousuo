@@ -6,6 +6,7 @@
   "port": 8765,
   "token": "",
   "timeout": 6,
+  "detail_timeout": 5,
   "deadline": 8,
   "spider_budget": 9,
   "max_workers": 8,
@@ -54,8 +55,20 @@
     },
     "remote_spider_url": ""
   },
+  // v2.3 跨源线路联邦：搜索时记住同名影片在其它源的 id，详情时把它们的线路
+  // 合并进同一个列表（按播放域名去重）。某个站点/CDN 挂了仍有其它线路可播，
+  // 不必依赖任何单一站点，也不必返回重选源。设为 enabled:false 可关闭。
+  "line_federation": {
+    "enabled": true,
+    "max_peers": 6,
+    "max_lines": 12,
+    "peer_timeout": 5
+  },
   "sources": [
     { "name": "无极", "url": "https://api.wujinapi.com/api.php/provide/vod/" },
-    { "name": "非凡", "url": "https://cj.ffzyapi.com/api.php/provide/vod/" }
+    { "name": "非凡", "url": "https://cj.ffzyapi.com/api.php/provide/vod/" },
+    { "name": "如意", "url": "https://cj.rycjapi.com/api.php/provide/vod/" },
+    { "name": "量子", "url": "https://cj.lziapi.com/api.php/provide/vod/" },
+    { "name": "百度", "url": "https://api.apibdzy.com/api.php/provide/vod/" }
   ]
 }

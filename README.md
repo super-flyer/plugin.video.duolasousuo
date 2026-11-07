@@ -28,6 +28,31 @@
 - 重複地址會自動去重；連續失敗的接口冷卻 30 分鐘，可在【清理緩存】中立即恢復。
 - 聚合搜索最多等待 12 秒並使用已返回的結果；慢接口仍可通過單接口入口單獨搜索。
 
+### v2.3 跨源線路聯邦（不依賴單一站点）
+
+對頻繁換域名 / 地區封禁的站點（含 `csp_*Guard` 的熱播、茉莉、荐片、瓜子），
+更穩的辦法不是逆向某個 Spider，而是**讓同一部片的播放線路來自多個源**：
+
+- `bridge/duola_bridge.py`：搜索時用 `note_peer()` 記住同名影片在各源的編碼 id
+  （即使被去重丟掉的條目也保留，TTL 15 分鐘、每源一條）；詳情時 `do_detail()`
+  並發取最多 3 個同源影片的詳情，`merge_peer_lines()` 按**播放域名去重**後把線路
+  併入主詳情，線路名帶 `[源名]` 前綴。某個 CDN 403/404 時仍可在同一個詳情裡
+  改選其它源的線路，不必返回重選源。
+- `sources.json` 的 `line_federation` 可關（`enabled:false`），`max_peers` /
+  `max_lines` 可調；狀態接口上報 `indexed_titles`，詳情響應帶
+  `federated` 與 `peer_sources`。
+- 源池同時補入實測可用的 `如意 / 量子 / 百度` 三個 CMS 接口，與既有源、
+  FongMi 配置提取的 CMS 源、IkBot Spider 一起參與聚合。
+- 插件 `main.py` 的線路預檢修正：實測有 CDN（`svip.ryiplay18.com`）
+  **HEAD 返回 404 但 GET 200 且內容是 `#EXTM3U`**，只信 HEAD 會把可播線路
+  誤標 `[不可用]`。現在 HEAD 遇 400/403/404 會回退 `GET Range: bytes=0-1023`，
+  並排除 HTML 錯誤頁。
+
+補充調研結論：熱播 / 荐片在公開 DRPY2 規則裡有明文 JS 版本
+（`荐片.js` 的 `api2.rinhome.com`、`热播库.js` 的 `reboku.cc`），
+但實測這兩個上游目前也已失效（停放頁 / 空回覆），
+故未把 JS 規則直譯作為落地方案；聯邦冗餘對站點失效更健壯。
+
 ### v2.2 播放地址補全（服務器側為主）
 
 `bridge/play_resolver.py` 會在**詳情回源時**把間接播放地址改寫成 Kodi 可直接播放的 URL，插件側只看到標準 `vod_play_url`：

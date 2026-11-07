@@ -778,6 +778,26 @@ def test_resolver_complete_via_player_and_page():
     assert again['by_method'].get('cached', 0) >= 1
 
 
+def test_resolver_short_circuits_failed_host():
+    calls = []
+
+    def failing_fetch(url, timeout, headers):
+        calls.append(url)
+        return ''
+
+    resolver = resolver_mod.PlayResolver(
+        {'max_workers': 2, 'budget': 3, 'failed_host_ttl': 300},
+        spider_host=None, fetcher=failing_fetch)
+    video = {'vod_play_from': 'dead',
+             'vod_play_url': '#'.join('第%d集$https://dead.example/share/%d' % (i, i)
+                                      for i in range(1, 13))}
+    summary = resolver.complete(video, 's0', base='')
+    assert summary['resolved'] == 0
+    assert len(calls) <= 2, calls  # 同一死域名不再对 12 集逐个重试
+    assert 'dead.example' in resolver._failed_hosts
+    assert resolver.status()['failed_hosts'] == 1
+
+
 def test_resolver_leaves_direct_urls_untouched():
     resolver = resolver_mod.PlayResolver({'enabled': True}, spider_host=None,
                                          fetcher=lambda *a: (_ for _ in ()).throw(AssertionError('should not fetch')))
@@ -875,6 +895,128 @@ def test_probe_play_url_passes_custom_headers(monkeypatch):
     assert mod.probe_play_url('https://cdn.x/1.m3u8|Referer=https%3A%2F%2Fsite.x%2F') is True
     assert seen['url'] == 'https://cdn.x/1.m3u8'
     assert seen['headers']['Referer'] == 'https://site.x/'
+
+
+# ---------------------------------------------------------------------------
+# v2.3: 跨源线路联邦 + HEAD 探测回退
+# ---------------------------------------------------------------------------
+def test_federation_note_and_find_peers():
+    bridge_mod.PEER_INDEX.clear()
+    now = 5000000
+    bridge_mod.note_peer('小城良方', 'tokA', 's0', '无极', now=now)
+    bridge_mod.note_peer('小城良方', 'tokB', 's1', '如意', now=now)
+    bridge_mod.note_peer('小城良方', 'tokC', 's1', '如意重复', now=now)
+    bridge_mod.note_peer('小城良方', 'tokD', 's2', '量子', now=now)
+    peers = bridge_mod.find_peers('小城良方', 'tokA', 's0', max_peers=3, now=now)
+    assert [p[0] for p in peers] == ['tokB', 'tokD']
+    assert bridge_mod.find_peers('小城良方', 'tokA', 's0', now=now + 1000) == []
+    assert bridge_mod.find_peers('不存在', 'tokA', 's0', now=now) == []
+    bridge_mod.PEER_INDEX.clear()
+
+
+def test_first_line_host():
+    assert bridge_mod.first_line_host('第1集$https://cdn.a.com/1.m3u8#第2集$https://x/2.m3u8') == 'cdn.a.com'
+    assert bridge_mod.first_line_host('https://cdn.b.com/1.m3u8|Referer=x') == 'cdn.b.com'
+    assert bridge_mod.first_line_host('') == ''
+
+
+def test_merge_peer_lines_dedups_by_host_and_keeps_alignment():
+    primary = {
+        'vod_play_from': 'wjm3u8',
+        'vod_play_url': '第1集$https://a.example/1.m3u8#第2集$https://a.example/2.m3u8',
+    }
+    peers = [
+        ('同域', {'vod_play_from': 'other',
+                  'vod_play_url': '第1集$https://a.example/9.m3u8'}),
+        ('如意', {'vod_play_from': 'rym3u8$$$ruyi',
+                  'vod_play_url': '第1集$https://b.example/1.m3u8$$$第1集$https://c.example/1.m3u8'}),
+    ]
+    added = bridge_mod.merge_peer_lines(primary, peers, max_lines=12)
+    assert added == 2
+    flags = primary['vod_play_from'].split('$$$')
+    urls = primary['vod_play_url'].split('$$$')
+    assert len(flags) == len(urls) == 3
+    assert flags[1] == '[如意]rym3u8' and 'b.example' in urls[1]
+    assert 'a.example/9.m3u8' not in primary['vod_play_url']
+
+
+def test_merge_peer_lines_respects_max_lines():
+    primary = {'vod_play_from': 'A', 'vod_play_url': '1$https://a.example/1.m3u8'}
+    peers = [('X', {'vod_play_from': 'x1$$$x2$$$x3',
+                    'vod_play_url': '1$https://b.example/1.m3u8$$$1$https://c.example/1.m3u8$$$1$https://d.example/1.m3u8'})]
+    assert bridge_mod.merge_peer_lines(primary, peers, max_lines=2) == 1
+    assert len(primary['vod_play_url'].split('$$$')) == 2
+
+
+def test_do_detail_federates_peer_lines(monkeypatch):
+    main_item = {'vod_name': '小城良方', 'vod_play_from': 'main',
+                 'vod_play_url': '第1集$https://a.example/1.m3u8'}
+    peer_item = {'vod_name': '小城良方', 'vod_play_from': 'ry',
+                 'vod_play_url': '第1集$https://b.example/1.m3u8'}
+    token = bridge_mod.encode_id('s0', '1')
+
+    def fake_raw(t, resolve=True):
+        if t == token:
+            return {'code': 1, 'list': [dict(main_item)], 'resolved': 0}, '无极'
+        return {'code': 1, 'list': [dict(peer_item)], 'resolved': 0}, '如意'
+
+    monkeypatch.setattr(bridge_mod, '_detail_raw', fake_raw)
+    bridge_mod.PEER_INDEX.clear()
+    bridge_mod.note_peer('小城良方', bridge_mod.encode_id('s1', '2'), 's1', '如意')
+    payload = bridge_mod.do_detail(token)
+    assert payload['federated'] == 1
+    assert '[如意]ry' in payload['list'][0]['vod_play_from']
+    assert 'b.example' in payload['list'][0]['vod_play_url']
+    bridge_mod.PEER_INDEX.clear()
+
+
+def test_probe_play_url_falls_back_to_get_on_head_403(monkeypatch):
+    class HeadResp:
+        status_code = 403
+
+    class GetResp:
+        status_code = 200
+
+        def iter_content(self, size):
+            yield b'#EXTM3U\n#EXT-X-VERSION:3\n'
+
+        def close(self):
+            pass
+
+    seen = {}
+
+    def fake_get(url=None, headers=None, timeout=None, stream=None):
+        seen.update(url=url, headers=headers, stream=stream)
+        return GetResp()
+
+    monkeypatch.setattr(mod.requests, 'head', lambda *a, **k: HeadResp())
+    monkeypatch.setattr(mod.requests, 'get', fake_get)
+    assert mod.probe_play_url('https://cdn.example/1.m3u8') is True
+    assert seen['stream'] is True and seen['headers']['Range'] == 'bytes=0-1023'
+
+
+def test_probe_play_url_rejects_html_and_hard_errors(monkeypatch):
+    class HeadResp:
+        status_code = 404
+
+    class HtmlResp:
+        status_code = 200
+
+        def iter_content(self, size):
+            yield b'<!DOCTYPE html><html>blocked</html>'
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod.requests, 'head', lambda *a, **k: HeadResp())
+    monkeypatch.setattr(mod.requests, 'get', lambda *a, **k: HtmlResp())
+    assert mod.probe_play_url('https://cdn.example/1.m3u8') is False
+
+    class Bad:
+        status_code = 500
+
+    monkeypatch.setattr(mod.requests, 'head', lambda *a, **k: Bad())
+    assert mod.probe_play_url('https://cdn.example/1.m3u8') is False
 
 
 # 无 pytest 环境也能直接执行：python tests_test_config.py

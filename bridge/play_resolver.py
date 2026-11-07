@@ -348,7 +348,9 @@ class PlayResolver(object):
         self.fetcher = fetcher or fetch_page
         self.clock = clock or time.time
         self._cache = {}
+        self._failed_hosts = {}   # 域名级失败短路，避免整条死线路逐集重试
         self._lock = threading.Lock()
+        self.failed_host_ttl = float(cfg.get('failed_host_ttl', 300) or 300)
         self.stats = {'total': 0, 'direct': 0, 'player': 0, 'page': 0,
                       'failed': 0, 'cached': 0, 'capped': 0}
 
@@ -362,6 +364,25 @@ class PlayResolver(object):
     def _put_cache(self, key, value):
         with self._lock:
             self._cache[key] = (self.clock() + self.cache_ttl, value)
+
+    def _host_cooling(self, host):
+        if not host:
+            return False
+        with self._lock:
+            return self._failed_hosts.get(host, 0) > self.clock()
+
+    def _mark_host_failed(self, host):
+        if not host:
+            return
+        with self._lock:
+            self._failed_hosts[host] = self.clock() + self.failed_host_ttl
+
+    @staticmethod
+    def _url_host(url):
+        try:
+            return urllib.parse.urlparse(url.split('|', 1)[0]).netloc.lower()
+        except Exception:
+            return ''
 
     def _via_player(self, source_id, flag, play_id):
         host = self.spider_host
@@ -378,13 +399,18 @@ class PlayResolver(object):
         target = resolve_relative(play_id, base)
         if not target:
             return ''
+        host = self._url_host(target)
+        if self._host_cooling(host):
+            return ''
         try:
             headers = page_headers(target)
             html = self.fetcher(target, self.fetch_timeout, headers)
         except Exception:
+            self._mark_host_failed(host)
             return ''
         media = extract_media_from_html(html, target)
         if not media:
+            self._mark_host_failed(host)
             return ''
         return attach_headers(media, headers_to_suffix(headers))
 
@@ -475,6 +501,7 @@ class PlayResolver(object):
     def status(self):
         return {'enabled': self.enabled,
                 'cache_entries': len(self._cache),
+                'failed_hosts': len(self._failed_hosts),
                 'stats': dict(self.stats),
                 'config': {'max_workers': self.max_workers, 'max_episodes': self.max_episodes,
                            'fetch_timeout': self.fetch_timeout, 'budget': self.budget,

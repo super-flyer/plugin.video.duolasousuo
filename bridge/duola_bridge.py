@@ -37,6 +37,8 @@ SOURCES = []
 STATS = {}
 SPIDER_HOST = None
 PLAY_RESOLVER = None
+PEER_INDEX = {}          # 同名影片 -> 其它源的编码 id（跨源线路联邦）
+PEER_LOCK = threading.Lock()
 HEALTH_LOCK = threading.Lock()
 HEALTH_PATH = os.path.expanduser('~/.local/share/duola-bridge/health.json')
 
@@ -212,6 +214,85 @@ def search_source(source, keyword, timeout=6):
     return data.get('list') or []
 
 
+PEER_TTL = 900
+PEER_MAX_PER_NAME = 6
+
+
+def note_peer(name, token, source_id, source_name, now=None):
+    """搜索时登记同名影片在各源的 id，即使被去重丢弃也保留，供详情合并线路。"""
+    key = str(name or '').strip().lower()
+    if not key or not token:
+        return
+    now = now or time.time()
+    with PEER_LOCK:
+        entry = PEER_INDEX.get(key)
+        if not entry or now - entry['ts'] > PEER_TTL:
+            entry = {'ts': now, 'tokens': []}
+            PEER_INDEX[key] = entry
+        tokens = entry['tokens']
+        if any(t[0] == token for t in tokens) or any(t[1] == source_id for t in tokens):
+            return
+        if len(tokens) < PEER_MAX_PER_NAME:
+            tokens.append((token, source_id, str(source_name or '')))
+        if len(PEER_INDEX) > 2000:
+            for stale in list(PEER_INDEX)[:500]:
+                PEER_INDEX.pop(stale, None)
+
+
+def find_peers(name, self_token, self_source, max_peers=3, now=None):
+    key = str(name or '').strip().lower()
+    now = now or time.time()
+    with PEER_LOCK:
+        entry = PEER_INDEX.get(key)
+        if not entry or now - entry['ts'] > PEER_TTL:
+            return []
+        return [t for t in entry['tokens'] if t[0] != self_token and t[1] != self_source][:max_peers]
+
+
+def first_line_host(line):
+    ep = (line or '').split('#')[0]
+    url = ep.split('$', 1)[1] if '$' in ep else ep
+    url = url.split('|', 1)[0]
+    try:
+        return urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return ''
+
+
+def merge_peer_lines(primary, peer_items, max_lines=12):
+    """把其它源的同名影片线路并入主详情；按播放域名去重，返回新增线路数。
+
+    peer_items: [(source_name, item_dict)]，item 为 CMS 形状的详情条目。
+    """
+    flags = [f for f in str(primary.get('vod_play_from') or '').split('$$$') if f]
+    urls = str(primary.get('vod_play_url') or '').split('$$$')
+    if len(flags) < len(urls):
+        flags += ['线路%d' % (i + 1) for i in range(len(flags), len(urls))]
+    hosts = set(filter(None, (first_line_host(u) for u in urls)))
+    added = 0
+    for source_name, item in peer_items:
+        if not isinstance(item, dict) or len(urls) >= max_lines:
+            continue
+        p_flags = str(item.get('vod_play_from') or '').split('$$$')
+        p_urls = str(item.get('vod_play_url') or '').split('$$$')
+        for index, line in enumerate(p_urls):
+            if len(urls) >= max_lines:
+                break
+            host = first_line_host(line)
+            if not line or (host and host in hosts):
+                continue
+            flag = p_flags[index].strip() if index < len(p_flags) else ''
+            flags.append('[' + str(source_name) + ']' + (flag or '线路'))
+            urls.append(line)
+            if host:
+                hosts.add(host)
+            added += 1
+    if added:
+        primary['vod_play_from'] = '$$$'.join(flags)
+        primary['vod_play_url'] = '$$$'.join(urls)
+    return added
+
+
 def do_search(keyword):
     deadline = time.time() + float(CFG.get('deadline', 10))
     timeout = float(CFG.get('timeout', 6))
@@ -244,11 +325,13 @@ def do_search(keyword):
                     name = str(item.get('vod_name') or '')
                     type_name = str(item.get('type_name') or '')
                     key = (name.lower(), type_name.lower())
+                    token = encode_id(provider_id, item.get('vod_id', ''))
+                    note_peer(name, token, provider_id, provider_name)
                     if key in seen:
                         continue
                     seen.add(key)
                     out = dict(item)
-                    out['vod_id'] = encode_id(provider_id, item.get('vod_id', ''))
+                    out['vod_id'] = token
                     out.setdefault('type_name', '')
                     out['vod_remarks'] = '[' + provider_name + '] ' + str(item.get('vod_remarks') or '')
                     results.append(out)
@@ -265,11 +348,13 @@ def do_search(keyword):
                 name = str(item.get('vod_name') or '')
                 type_name = str(item.get('type_name') or '')
                 key = (name.lower(), type_name.lower())
+                token = encode_id(source['id'], item.get('vod_id', ''))
+                note_peer(name, token, source['id'], source['name'])
                 if key in seen:
                     continue
                 seen.add(key)
                 out = dict(item)
-                out['vod_id'] = encode_id(source['id'], item.get('vod_id', ''))
+                out['vod_id'] = token
                 out.setdefault('type_name', '')
                 out['vod_remarks'] = '[' + source['name'] + '] ' + str(item.get('vod_remarks') or '')
                 results.append(out)
@@ -283,36 +368,101 @@ def do_search(keyword):
     }
 
 
-def do_detail(token):
+def _detail_raw(token, resolve=True):
+    """取单个源的原始详情，不做跨源合并（供联邦调用，避免死循环）。
+
+    联邦拉取 peer 时传 resolve=False，跳过耗时的播放地址补全，只取线路。
+    """
     decoded = decode_id(token)
     if not decoded:
-        return {'code': 0, 'msg': 'bad id', 'list': []}
+        return {'code': 0, 'msg': 'bad id', 'list': []}, ''
     source_id, vod_id = decoded
+    resolved = 0
     if SPIDER_HOST and source_id in SPIDER_HOST.providers:
         items = SPIDER_HOST.detail(source_id, vod_id)
         base = pr.provider_base(SPIDER_HOST, source_id)
-        resolved = 0
+        source_name = getattr(SPIDER_HOST.providers[source_id], 'name', source_id)
         for item in items:
             item['vod_id'] = token
-            if PLAY_RESOLVER:
+            if PLAY_RESOLVER and resolve:
                 resolved += PLAY_RESOLVER.complete(item, source_id, base=base)['resolved']
         return {'code': 1, 'msg': 'duola-bridge (spider)', 'list': items,
-                'total': len(items), 'page': 1, 'pagecount': 1, 'resolved': resolved}
+                'total': len(items), 'page': 1, 'pagecount': 1, 'resolved': resolved}, source_name
     source = next((s for s in SOURCES if s['id'] == source_id), None)
     if not source:
-        return {'code': 0, 'msg': 'unknown source', 'list': []}
+        return {'code': 0, 'msg': 'unknown source', 'list': []}, ''
     try:
-        data = fetch_json(build_query(source['url'], {'ac': 'detail', 'ids': vod_id}), float(CFG.get('timeout', 6)))
+        data = fetch_json(build_query(source['url'], {'ac': 'detail', 'ids': vod_id}), float(CFG.get('detail_timeout', 5)))
     except Exception as e:
-        return {'code': 0, 'msg': type(e).__name__, 'list': []}
+        return {'code': 0, 'msg': type(e).__name__, 'list': []}, source['name']
     items = data.get('list') or []
-    resolved = 0
     for item in items:
         item['vod_id'] = token
-        if PLAY_RESOLVER:
+        if PLAY_RESOLVER and resolve:
             resolved += PLAY_RESOLVER.complete(item, source_id, base=source['url'])['resolved']
     return {'code': 1, 'msg': 'duola-bridge', 'list': items,
-            'total': len(items), 'page': 1, 'pagecount': 1, 'resolved': resolved}
+            'total': len(items), 'page': 1, 'pagecount': 1, 'resolved': resolved}, source['name']
+
+
+def federation_config():
+    cfg = CFG.get('line_federation') or {}
+    return {
+        'enabled': bool(cfg.get('enabled', True)),
+        'max_peers': max(0, int(cfg.get('max_peers', 3))),
+        'max_lines': max(1, int(cfg.get('max_lines', 12))),
+        'peer_timeout': float(cfg.get('peer_timeout', 5)),
+    }
+
+
+def do_detail(token):
+    """详情 = 主源 + 同名影片在其它源的线路（跨源联邦）。
+
+    好处：某个源/站点（含频繁失效的 Spider 站点）的 CDN 挂了，
+    用户仍能在同一个详情里选到其它源的可播线路，无需返回重选。
+    """
+    payload, source_name = _detail_raw(token)
+    if payload.get('code') != 1 or not payload.get('list'):
+        return payload
+    cfg = federation_config()
+    payload['federated'] = 0
+    if not cfg['enabled'] or cfg['max_peers'] <= 0:
+        return payload
+    primary = payload['list'][0]
+    decoded = decode_id(token)
+    self_source = decoded[0] if decoded else ''
+    peers = find_peers(primary.get('vod_name'), token, self_source, max_peers=cfg['max_peers'])
+    if not peers:
+        return payload
+
+    def fetch_peer(peer):
+        try:
+            result, _ = _detail_raw(peer[0], resolve=False)
+            items = result.get('list') or []
+            return (peer[2] or peer[1], items[0] if items else None)
+        except Exception:
+            return (peer[2] or peer[1], None)
+
+    pool = ThreadPoolExecutor(max_workers=min(cfg['max_peers'], len(peers)))
+    peer_items = []
+    try:
+        futs = [pool.submit(fetch_peer, p) for p in peers]
+        # 超预算时保留已完成的部分，不要清空
+        for fut in as_completed(futs, timeout=cfg['peer_timeout']):
+            try:
+                name, item = fut.result()
+                if item:
+                    peer_items.append((name, item))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    # 合并只引入直链线路；不再整体重跑播放补全，避免详情耗时翻倍。
+    # 若个别线路是间接地址，插件侧 v2.0 的预检会标 [不可用]。
+    payload['federated'] = merge_peer_lines(primary, peer_items, max_lines=cfg['max_lines'])
+    payload['peer_sources'] = [n for n, _ in peer_items]
+    return payload
 
 
 def do_resolve(source_id, flag, play_id, base=''):
@@ -334,13 +484,14 @@ def do_play(provider_id, flag, play_id):
 def status_payload():
     health = health_load()
     return {
-        'code': 1, 'service': 'duola-bridge', 'version': '2.2.0',
+        'code': 1, 'service': 'duola-bridge', 'version': '2.3.0',
         'sources': [{'id': s['id'], 'name': s['name'], 'url': s['url'],
                      'cooling': is_cooling(s['url'], health, cooldown=int(CFG.get('cooldown', 1800)))}
                     for s in SOURCES],
         'stats': STATS,
         'spider': SPIDER_HOST.status() if SPIDER_HOST else {'enabled': False},
         'play_resolver': PLAY_RESOLVER.status() if PLAY_RESOLVER else {'enabled': False},
+        'line_federation': dict(federation_config(), indexed_titles=len(PEER_INDEX)),
     }
 
 
