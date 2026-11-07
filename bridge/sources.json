@@ -5,13 +5,41 @@
   "listen": "127.0.0.1",
   "port": 8765,
   "token": "",
-  "timeout": 6,
-  "deadline": 10,
+  "timeout": 5,
+  "deadline": 6,
+  "spider_budget": 8,
   "max_workers": 8,
   "cooldown": 1800,
   // FongMi/TVBox 配置（相对工作目录或绝对路径/URL）。
   // 其中 type 0/1 的 HTTP CMS 站点会自动并入源列表；type 3 的 spider 站点只统计、跳过。
   "fongmi_config": "fongmi_config.json",
+  // Spider Host（v2.1）：执行第三方 Spider 字节码有风险，默认只启用本地 demo；
+  // java.classes 是显式白名单，jar 放在 jars/ 目录（标准 JVM .class 的 spider jar）。
+  // Android dex 格式的 csp_*Guard 无法在 Linux JVM 运行，只统计不执行。
+  "spider_host": {
+    "enabled": true,
+    "timeout": 5,
+    "python": {
+      "enabled": true,
+      "spiders": [
+        { "name": "DemoSpider", "file": "spiders/demo.py", "ext": "{}" }
+      ]
+    },
+    "js": { "enabled": false, "spiders": [] },
+    "java": {
+      "enabled": true,
+      "jar_dir": "jars",
+      // Bili 的 searchContent 需要有效 B 站 cookie（空 cookie 会被引擎风控返回非 JSON），
+      // 已从白名单移除；填了真实 cookie 后可自行加回。
+      // 下列类实测 searchContent 能返回结果，ext 取自 FongMi 配置。
+      "classes": [
+        { "name": "Zxzj", "class": "Zxzj", "ext": "{}" },
+        { "name": "Wogg", "class": "Wogg", "ext": "{\"site\":[\"https://www.wogg.net\",\"https://www.wogg.live\"]}" },
+        { "name": "SeedHub", "class": "SeedHub", "ext": "{\"site\":[\"https://seedog.cc\",\"https://seedhub.pro\"]}" }
+      ]
+    },
+    "remote_spider_url": ""
+  },
   "sources": [
     { "name": "无极", "url": "https://api.wujinapi.com/api.php/provide/vod/" },
     { "name": "非凡", "url": "https://cj.ffzyapi.com/api.php/provide/vod/" }

@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -23,12 +24,16 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import spider_host as sh
+
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
 CFG = {}
 SOURCES = []
 STATS = {}
+SPIDER_HOST = None
 HEALTH_LOCK = threading.Lock()
 HEALTH_PATH = os.path.expanduser('~/.local/share/duola-bridge/health.json')
 
@@ -213,9 +218,38 @@ def do_search(keyword):
     results, seen = [], set()
     pool = ThreadPoolExecutor(max_workers=int(CFG.get('max_workers', 8)))
     futures = {pool.submit(search_source, s, keyword, timeout): s for s in active}
+    # Spider Host 与 CMS 源并行，避免串行叠加把插件的本地请求拖超时
+    spider_future = None
+    if SPIDER_HOST and SPIDER_HOST.enabled:
+        spider_future = pool.submit(SPIDER_HOST.search, keyword, float(CFG.get('spider_budget', 8)))
+        futures[spider_future] = None
+    wait_timeout = max(1, deadline - time.time())
+    if spider_future:
+        wait_timeout = max(wait_timeout, float(CFG.get('spider_budget', 8)))
     try:
-        for future in as_completed(futures, timeout=max(1, deadline - time.time())):
+        for future in as_completed(futures, timeout=wait_timeout):
             source = futures[future]
+            if source is None:
+                try:
+                    spider_items = future.result()
+                except Exception as e:
+                    print('[bridge] spider search failed:', type(e).__name__, flush=True)
+                    continue
+                for provider_id, provider_name, item in spider_items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get('vod_name') or '')
+                    type_name = str(item.get('type_name') or '')
+                    key = (name.lower(), type_name.lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out = dict(item)
+                    out['vod_id'] = encode_id(provider_id, item.get('vod_id', ''))
+                    out.setdefault('type_name', '')
+                    out['vod_remarks'] = '[' + provider_name + '] ' + str(item.get('vod_remarks') or '')
+                    results.append(out)
+                continue
             try:
                 items = future.result()
             except Exception as e:
@@ -251,6 +285,12 @@ def do_detail(token):
     if not decoded:
         return {'code': 0, 'msg': 'bad id', 'list': []}
     source_id, vod_id = decoded
+    if SPIDER_HOST and source_id in SPIDER_HOST.providers:
+        items = SPIDER_HOST.detail(source_id, vod_id)
+        for item in items:
+            item['vod_id'] = token
+        return {'code': 1, 'msg': 'duola-bridge (spider)', 'list': items,
+                'total': len(items), 'page': 1, 'pagecount': 1}
     source = next((s for s in SOURCES if s['id'] == source_id), None)
     if not source:
         return {'code': 0, 'msg': 'unknown source', 'list': []}
@@ -264,14 +304,22 @@ def do_detail(token):
     return {'code': 1, 'msg': 'duola-bridge', 'list': items, 'total': len(items), 'page': 1, 'pagecount': 1}
 
 
+def do_play(provider_id, flag, play_id):
+    """Spider 两级取址：flag + 剧集 id -> 真实播放 URL 与 header。"""
+    if not SPIDER_HOST or provider_id not in SPIDER_HOST.providers:
+        return {'code': 0, 'msg': 'unknown spider provider'}
+    return {'code': 1, 'result': SPIDER_HOST.play(provider_id, flag, play_id)}
+
+
 def status_payload():
     health = health_load()
     return {
-        'code': 1, 'service': 'duola-bridge', 'version': '2.0.0',
+        'code': 1, 'service': 'duola-bridge', 'version': '2.1.0',
         'sources': [{'id': s['id'], 'name': s['name'], 'url': s['url'],
                      'cooling': is_cooling(s['url'], health, cooldown=int(CFG.get('cooldown', 1800)))}
                     for s in SOURCES],
         'stats': STATS,
+        'spider': SPIDER_HOST.status() if SPIDER_HOST else {'enabled': False},
     }
 
 
@@ -307,23 +355,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(do_detail((query.get('ids') or [''])[0]))
         if action == 'list':
             return self._reply({'code': 1, 'class': [{'type_id': '0', 'type_name': '全部'}]})
+        if action == 'play':
+            return self._reply(do_play((query.get('provider') or [''])[0],
+                                       (query.get('flag') or [''])[0],
+                                       (query.get('id') or [''])[0]))
+        if action == 'spider_test':
+            return self._reply(SPIDER_HOST.self_test() if SPIDER_HOST else {'ok': False, 'error': 'not initialized'})
         return self._reply(status_payload())
 
 
 def main():
-    global CFG, SOURCES, STATS
+    global CFG, SOURCES, STATS, SPIDER_HOST
     parser = argparse.ArgumentParser(description='duola-bridge (FongMi/CMS adapter)')
     parser.add_argument('--config', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sources.json'))
     args = parser.parse_args()
     with open(args.config, encoding='utf-8') as f:
         CFG = json.loads(strip_jsonc(f.read()))
     SOURCES, STATS = load_sources(CFG)
+    host_cfg = dict(CFG)
+    host_cfg['spider_host'] = dict(CFG.get('spider_host') or {})
+    host_cfg['spider_host']['dex_sites'] = STATS.get('spider_skipped', 0)
+    SPIDER_HOST = sh.SpiderHost(host_cfg, base_dir=os.path.dirname(os.path.abspath(__file__)))
     listen = CFG.get('listen', '127.0.0.1')
     port = int(CFG.get('port', 8765))
     server = ThreadingHTTPServer((listen, port), Handler)
     server.daemon_threads = True
-    print('[bridge] listening on %s:%d, sources=%d, spider_skipped=%d'
-          % (listen, port, len(SOURCES), STATS.get('spider_skipped', 0)), flush=True)
+    print('[bridge] listening on %s:%d, cms_sources=%d, spider_providers=%d, dex_skipped=%d'
+          % (listen, port, len(SOURCES), len(SPIDER_HOST.providers),
+             STATS.get('spider_skipped', 0)), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
