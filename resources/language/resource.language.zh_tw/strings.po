@@ -42,6 +42,10 @@ msgctxt "#30105"
 msgid "Clear cache"
 msgstr "清理緩存"
 
+msgctxt "#30106"
+msgid "Extra search engines"
+msgstr "額外搜尋接口（多個用 | 分隔）"
+
 #3000x
 msgctxt "#30001"
 msgid "List Mode"
