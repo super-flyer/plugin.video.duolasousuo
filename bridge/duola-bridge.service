@@ -1,0 +1,17 @@
+[Unit]
+Description=duola-bridge - FongMi/CMS adapter for duolasousuo Kodi addon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=super
+WorkingDirectory=/home/super/duola-bridge
+ExecStart=/usr/bin/python3 /home/super/duola-bridge/duola_bridge.py --config /home/super/duola-bridge/sources.json
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

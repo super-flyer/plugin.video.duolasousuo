@@ -38,6 +38,8 @@ ADDON_CloudCacheTxt = os.path.join(ADDON_TempDir, 'Duola_Local_Search_Engine.txt
 # 健康缓存放在 addon_data（持久化），不放 temp：设置里的"清理缓存"会删掉整个 temp 目录
 ADDON_DataDir = os.path.join(xbmcvfs.translatePath('special://profile/addon_data'), ADDON_object.getAddonInfo('id'), '')
 ADDON_HealthFile = os.path.join(ADDON_DataDir, 'engine_health.json')
+ADDON_PlaybackHealthFile = os.path.join(ADDON_DataDir, 'playback_health.json')
+ADDON_PlaybackStateFile = os.path.join(ADDON_DataDir, 'playback_state.json')
 
 ADDON_api = 'https://raw.githubusercontent.com/super-flyer/plugin.video.duolasousuo/refs/heads/main/v1.json'
 
@@ -56,6 +58,13 @@ ENGINE_COOLDOWN = 1800   # 死源冷却 30 分钟
 SEARCH_MAX_WORKERS = 8   # 并发上限，避免树莓派上线程膨胀
 CONFIG_PROBE_TIMEOUT = 4 # 配置页探测超时
 HEALTH_LOCK = threading.Lock()
+
+# v2.0: 播放域名健康缓存 / 线路预检 / 失败自动换线路
+PLAYBACK_COOLDOWN = 1800
+PLAYBACK_PROBE_TIMEOUT = 2
+PLAYBACK_MAX_SWITCH = 3
+LOCAL_BRIDGE_TIMEOUT = 12   # 本地 bridge 聚合多源+播放补全，单请求超时放宽
+LOCAL_BRIDGE_BUDGET = 12    # 本地 bridge 引擎预算
 
 # global debug
 print('duola_debug: [' + str(ADDON_handle) + ']' + ADDON_address + ' || ' + ADDON_parm)
@@ -272,6 +281,32 @@ def build_stream_headers(url):
     return '&'.join(pairs)
 
 
+def split_play_headers(url):
+    """v2.2: 把 Kodi |Key=Value&... 语法拆成 (纯 URL, header dict)。"""
+    original = url or ''
+    clean, _, suffix = original.partition('|')
+    headers = {}
+    for pair in suffix.split('&'):
+        if '=' not in pair:
+            continue
+        key, value = pair.split('=', 1)
+        if key:
+            headers[key] = urllib.parse.unquote(value)
+    return clean, headers
+
+
+def merge_stream_headers(clean, custom_headers):
+    """v2.2: Spider 给的 header 覆盖默认的 UA/Referer/Origin，避免 adaptive 分支丢头。"""
+    merged = {}
+    for part in build_stream_headers(clean).split('&'):
+        if '=' in part:
+            key = part.split('=', 1)[0]
+            merged[key.lower()] = part
+    for key, value in (custom_headers or {}).items():
+        merged[str(key).lower()] = str(key) + '=' + urllib.parse.quote(str(value), safe='')
+    return '&'.join(merged.values())
+
+
 def get_kodi_major():
     try:
         return int(str(xbmc.getInfoLabel('System.BuildVersion')).split('.')[0])
@@ -295,9 +330,9 @@ def prepare_play_item(list_item, url, use_adaptive=None, major=None):
     否则回退直链，在 URL 后拼 |User-Agent=...&Referer=...&Origin=...
     """
     original = url or ''
-    clean = original.split('|', 1)[0]
+    clean, custom_headers = split_play_headers(original)
     media = get_url_media_type(clean)
-    header_text = build_stream_headers(clean)
+    header_text = merge_stream_headers(clean, custom_headers)
     if use_adaptive is None:
         use_adaptive = detect_inputstream_adaptive()
     if major is None:
@@ -323,13 +358,193 @@ def prepare_play_item(list_item, url, use_adaptive=None, major=None):
     except Exception as e:
         print('duola_debug:prepare_play_item fallback=' + str(e))
 
-    if '|' in original:
-        return original
     return clean + '|' + header_text if header_text else clean
 
 
-def parse_play_lines(video):
-    """v1.9: 按 vod_play_from + vod_play_url 构建线路模型，线路内只放本线路剧集。"""
+# ---------------------------------------------------------------------------
+# v2.0: playback host health + line probing + state for auto switch
+# ---------------------------------------------------------------------------
+def is_local_bridge(url):
+    """本机/内网适配服务：聚合多个上游，需要比普通 CMS 更长的超时预算。"""
+    try:
+        host = urllib.parse.urlparse((url or '').split('|', 1)[0]).hostname or ''
+    except Exception:
+        return False
+    host = host.lower()
+    if host in ('127.0.0.1', 'localhost', '::1'):
+        return True
+    if host.startswith(('10.', '192.168.')):
+        return True
+    if host.startswith('172.'):
+        try:
+            return 16 <= int(host.split('.')[1]) <= 31
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
+def play_host(url):
+    try:
+        return urllib.parse.urlparse((url or '').split('|', 1)[0]).netloc.lower()
+    except Exception:
+        return ''
+
+
+def playback_health_load(path=None):
+    target = path or ADDON_PlaybackHealthFile
+    try:
+        with xbmcvfs.File(target) as f:
+            data = json.loads(f.read() or '{}')
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def playback_is_cooling(url, health=None, now=None):
+    data = health if health is not None else playback_health_load()
+    if now is None:
+        now = int(time.time())
+    host = play_host(url)
+    if not host:
+        return False
+    entry = data.get(host)
+    if not isinstance(entry, dict):
+        return False
+    try:
+        return float(entry.get('fail_until', 0)) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def playback_record_failure(url, path=None, now=None):
+    target = path or ADDON_PlaybackHealthFile
+    if now is None:
+        now = int(time.time())
+    host = play_host(url)
+    if not host:
+        return None
+    with HEALTH_LOCK:
+        data = playback_health_load(target)
+        entry = data.get(host) if isinstance(data.get(host), dict) else {}
+        entry['fail_until'] = now + PLAYBACK_COOLDOWN
+        entry['fails'] = int(entry.get('fails', 0)) + 1
+        entry['last_fail'] = now
+        data[host] = entry
+        try:
+            xbmcvfs.mkdirs(ADDON_DataDir)
+            with xbmcvfs.File(target, 'w') as f:
+                f.write(json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            print('duola_debug:playback_record_failure failed=' + str(e))
+            return None
+    return data
+
+
+def playback_clear(path=None):
+    target = path or ADDON_PlaybackHealthFile
+    with HEALTH_LOCK:
+        try:
+            if xbmcvfs.exists(target):
+                xbmcvfs.delete(target)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def is_indirect_play_url(url):
+    """无后缀且属于分享/播放页路径的地址，Kodi 无法直接播放。"""
+    path = url_media_path(url)
+    name = path.rsplit('/', 1)[-1]
+    if '.' in name:
+        return False
+    return any(marker in path.lower() for marker in ('/share/', '/play/', '/v/', '/video/', '/id/'))
+
+
+def probe_play_url(url, timeout=None):
+    """轻量探测播放地址；返回 True 表示可尝试播放。"""
+    if not url:
+        return False
+    timeout = timeout or PLAYBACK_PROBE_TIMEOUT
+    try:
+        head = getattr(requests, 'head', None)
+        clean, custom_headers = split_play_headers(url)
+        probe_headers = dict(UA_head)
+        probe_headers.update(custom_headers)
+        if head:
+            res = head(clean, headers=probe_headers, timeout=timeout, allow_redirects=True)
+            return res.status_code < 400 or res.status_code in (405, 501)
+        res = requests.get(clean, headers=probe_headers, timeout=timeout)
+        return res.status_code < 400
+    except requests.exceptions.RequestException:
+        return False
+    except Exception:
+        return True
+
+
+def probe_play_lines(lines, health=None, now=None, probe_func=None):
+    """并发探测每条线路首集；失败记录域名冷却并标记线路不可用。"""
+    probe = probe_func or probe_play_url
+    data = health if health is not None else playback_health_load()
+    if now is None:
+        now = int(time.time())
+    results = [None] * len(lines)
+    threads = []
+
+    def worker(i, original):
+        first = original['episodes'][0]['url'] if original.get('episodes') else ''
+        indirect = bool(first) and is_indirect_play_url(first)
+        available = bool(first) and not indirect and not playback_is_cooling(first, data, now)
+        if available and not probe(first):
+            playback_record_failure(first, now=now)
+            available = False
+        item = dict(original)
+        item['available'] = available
+        item['indirect'] = indirect
+        item['host'] = play_host(first)
+        results[i] = item
+
+    for i, line in enumerate(lines):
+        t = threading.Thread(target=worker, args=(i, line))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=PLAYBACK_PROBE_TIMEOUT + 2)
+    return [item if item is not None else dict(line, available=True, indirect=False, host='')
+            for item, line in zip(results, lines)]
+
+
+def write_playback_state(state, path=None):
+    target = path or ADDON_PlaybackStateFile
+    try:
+        xbmcvfs.mkdirs(ADDON_DataDir)
+        with xbmcvfs.File(target, 'w') as f:
+            f.write(json.dumps(state, ensure_ascii=False))
+        return True
+    except Exception as e:
+        print('duola_debug:write_playback_state failed=' + str(e))
+        return False
+
+
+def pick_next_candidate(state, current_url, max_switch=None):
+    """从备用线路里挑一个不同域名、未尝试过的地址。"""
+    limit = max_switch or PLAYBACK_MAX_SWITCH
+    if state.get('attempts', 0) >= limit:
+        return None
+    current_host = play_host(current_url)
+    tried = set(state.get('tried', []))
+    for url in state.get('candidates', []):
+        if not url or url == current_url or url in tried:
+            continue
+        if play_host(url) == current_host:
+            continue
+        return url
+    return None
+
+
+def parse_play_lines(video, health=None, now=None):
+    """v2.0: 线路模型 + 播放域名健康标记 + 间接地址识别。"""
     flags = str(video.get('vod_play_from', '') or '').split('$$$')
     urls = str(video.get('vod_play_url', '') or '').split('$$$')
     lines = []
@@ -349,9 +564,13 @@ def parse_play_lines(video):
         if not episodes:
             continue
         flag = flags[index].strip() if index < len(flags) else ''
+        first = episodes[0]['url']
         lines.append({
             'name': flag or '线路%d' % (index + 1),
             'episodes': episodes,
+            'host': play_host(first),
+            'indirect': is_indirect_play_url(first),
+            'available': not playback_is_cooling(first, health, now),
         })
     return lines
 
@@ -782,7 +1001,10 @@ def request_engine_json_candidates(base_url, suffix='', deadline=None, stats=Non
                     if url_with_suffix not in candidate_urls:
                         candidate_urls.append(url_with_suffix)
 
-    request_timeout = SEARCH_TIMEOUT if deadline is not None else UA_timeout
+    if deadline is not None and is_local_bridge(base_url):
+        request_timeout = LOCAL_BRIDGE_TIMEOUT
+    else:
+        request_timeout = SEARCH_TIMEOUT if deadline is not None else UA_timeout
     seen = set()
     results = []
     for candidate in candidate_urls:
@@ -941,7 +1163,8 @@ def Web_load_search_multi(engine_list, keyword, deadline_seconds=None):
                     continue
                 engine_url = engine.get('url', '')
                 source_name = engine.get('name', '')
-                engine_deadline = min(deadline, time.time() + ENGINE_BUDGET)
+                budget = LOCAL_BRIDGE_BUDGET if is_local_bridge(engine_url) else ENGINE_BUDGET
+                engine_deadline = min(deadline, time.time() + budget)
                 stats = {}
                 candidates = request_engine_json_candidates(
                     engine_url, '?wd=' + keyword,
@@ -1055,7 +1278,19 @@ def Web_load_detail_one(url, detail_id):
     except (IndexError, KeyError, ValueError, TypeError):
         pass
 
-    lines = parse_play_lines(video)
+    lines = parse_play_lines(video, health=playback_health_load())
+    lines = probe_play_lines(lines)
+    if not any(line.get('available') for line in lines):
+        ADDON_dialog.notification(heading=ADDON_name, message='该资源站线路当前不可用，建议返回选择其他源', time=4000)
+    for line in lines:
+        if not line.get('available'):
+            line['name'] = line['name'] + ' [不可用]'
+    usable = [line for line in lines if line.get('available') and not line.get('indirect')]
+    if not usable:
+        usable = [line for line in lines if line.get('available')]
+    if not usable:
+        usable = lines
+    lines = usable
     if not lines:
         ADDON_dialog.notification(heading=ADDON_name, message='抱歉，找不到播放列表', time=3000)
         xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=True)
@@ -1102,6 +1337,15 @@ def Web_load_detail_one(url, detail_id):
     if select_i < 0:
         finish_directory()
         return
+
+    # v2.0: 写备用线路状态，service.py 在播放失败时自动换线路
+    write_playback_state({
+        'current': episodes[select_i]['url'],
+        'candidates': [line['episodes'][select_i]['url'] for line in lines if len(line['episodes']) > select_i],
+        'attempts': 0,
+        'tried': [],
+        'written': int(time.time()),
+    })
 
     # player_style 1：只播当前线路的选中集
     if ADDON_PlayerStyle == 1:
@@ -1485,6 +1729,7 @@ if '?action=clearCache' in ADDON_parm:
     print("duola_debug", ADDON_parm)
     # v1.8: 同时清空死源冷却，让所有接口重新参与聚合搜索
     health_clear()
+    playback_clear()
     if xbmcvfs.exists(ADDON_TempDir):
         if xbmcvfs.rmdir(ADDON_TempDir, True):
             ADDON_dialog.notification(heading=ADDON_name, message="清理成功", time=3000)
