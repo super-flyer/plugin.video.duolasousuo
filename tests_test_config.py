@@ -36,6 +36,30 @@ class DummyListItem:
         return lambda *a, **k: None
 
 
+class RecordingListItem:
+    """记录 v1.9 prepare_play_item 设置的属性。"""
+
+    def __init__(self):
+        self.properties = {}
+        self.mime = None
+        self.content_lookup = None
+
+    def setProperty(self, key, value):
+        self.properties[key] = value
+
+    def setMimeType(self, value):
+        self.mime = value
+
+    def setContentLookup(self, value):
+        self.content_lookup = value
+
+    def setArt(self, *a, **k):
+        pass
+
+    def setInfo(self, *a, **k):
+        pass
+
+
 class DummyDialog:
     def notification(self, *a, **k):
         pass
@@ -69,6 +93,7 @@ sys.modules['requests'] = requests
 
 xbmc = types.ModuleType('xbmc')
 xbmc.PLAYLIST_VIDEO = 1
+xbmc.getInfoLabel = lambda *a, **k: '21.3'
 xbmcgui = types.ModuleType('xbmcgui')
 xbmcgui.ListItem = DummyListItem
 xbmcgui.Dialog = DummyDialog
@@ -311,6 +336,105 @@ def test_extra_engine_setting_has_localized_label():
     with open('resources/settings.xml', encoding='utf-8') as f:
         text = f.read()
     assert '额外搜索接口' in text
+
+
+# ---------------------------------------------------------------------------
+# v1.9: 线路分组 / MIME / adaptive / header
+# ---------------------------------------------------------------------------
+def test_check_url_mime_handles_query_and_no_extension():
+    assert mod.check_url_mime('https://x/a.m3u8?token=abc') is True
+    assert mod.check_url_mime('https://x/a.mp4?x=1') is True
+    assert mod.check_url_mime('https://x/play/abc123') is True
+    assert mod.check_url_mime('https://x/index.html') is False
+    assert mod.check_url_mime('https://x/pic.jpg') is False
+
+
+def test_get_url_media_type():
+    assert mod.get_url_media_type('https://x/a.m3u8?token=1') == 'hls'
+    assert mod.get_url_media_type('https://x/a.mpd') == 'dash'
+    assert mod.get_url_media_type('https://x/a.mp4?x=1') == 'file'
+    assert mod.get_url_media_type('https://x/play/id') == 'unknown'
+
+
+def test_build_stream_headers():
+    header = mod.build_stream_headers('https://cdn.example.com/a.m3u8?token=1')
+    assert 'User-Agent=' in header
+    assert 'Referer=https%3A%2F%2Fcdn.example.com%2F' in header
+    assert 'Origin=https%3A%2F%2Fcdn.example.com' in header
+    assert mod.build_stream_headers('') == ''
+
+
+def test_get_kodi_major():
+    assert mod.get_kodi_major() == 21
+
+
+def test_detect_inputstream_adaptive():
+    assert mod.detect_inputstream_adaptive(lambda _id: object()) is True
+
+    def missing(_id):
+        raise RuntimeError('not installed')
+
+    assert mod.detect_inputstream_adaptive(missing) is False
+
+
+def test_prepare_play_item_hls_with_adaptive():
+    item = RecordingListItem()
+    url = mod.prepare_play_item(item, 'https://cdn.example.com/a.m3u8?token=1', use_adaptive=True, major=21)
+    assert url == 'https://cdn.example.com/a.m3u8?token=1'
+    assert item.properties['inputstream'] == 'inputstream.adaptive'
+    assert item.properties['inputstream.adaptive.manifest_type'] == 'hls'
+    assert item.mime == mod.MIME_HLS
+    assert 'Referer=' in item.properties['inputstream.adaptive.stream_headers']
+    assert item.content_lookup is False
+
+
+def test_prepare_play_item_kodi18_property():
+    item = RecordingListItem()
+    mod.prepare_play_item(item, 'https://x/a.m3u8', use_adaptive=True, major=18)
+    assert item.properties['inputstreamaddon'] == 'inputstream.adaptive'
+    assert 'inputstream' not in item.properties
+
+
+def test_prepare_play_item_fallback_direct():
+    item = RecordingListItem()
+    url = mod.prepare_play_item(item, 'https://x/a.mp4?x=1', use_adaptive=False, major=21)
+    assert url.startswith('https://x/a.mp4?x=1|')
+    assert 'Origin=' in url
+    assert item.mime is None
+
+
+def test_prepare_play_item_hls_without_adaptive():
+    item = RecordingListItem()
+    url = mod.prepare_play_item(item, 'https://x/a.m3u8', use_adaptive=False, major=21)
+    assert url.startswith('https://x/a.m3u8|')
+    assert item.mime == mod.MIME_HLS
+    assert 'inputstream' not in item.properties
+
+
+def test_parse_play_lines_groups_flags():
+    video = {
+        'vod_play_from': '线路A$$$线路B',
+        'vod_play_url': '01集$https://a/1.m3u8#02集$https://a/2.m3u8$$$01集$https://b/1.mp4',
+    }
+    lines = mod.parse_play_lines(video)
+    assert [line['name'] for line in lines] == ['线路A', '线路B']
+    assert len(lines[0]['episodes']) == 2
+    assert lines[0]['episodes'][0] == {'name': '01集', 'url': 'https://a/1.m3u8'}
+    assert len(lines[1]['episodes']) == 1
+
+
+def test_parse_play_lines_single_line_fallback_name():
+    video = {'vod_play_from': '', 'vod_play_url': '01集$https://a/1.m3u8?token=x'}
+    lines = mod.parse_play_lines(video)
+    assert len(lines) == 1 and lines[0]['name'] == '线路1'
+    assert lines[0]['episodes'][0]['url'].endswith('?token=x')
+
+
+def test_parse_play_lines_skips_non_video():
+    video = {'vod_play_from': '', 'vod_play_url': '广告$https://a/index.html#正片$https://a/1.mp4'}
+    lines = mod.parse_play_lines(video)
+    assert len(lines[0]['episodes']) == 1
+    assert lines[0]['episodes'][0]['name'] == '正片'
 
 
 # 无 pytest 环境也能直接执行：python tests_test_config.py

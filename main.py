@@ -24,7 +24,10 @@ ADDON_address = sys.argv[0]  # 当前插件地址
 ADDON_parm = sys.argv[2]  # 问号以后的内容
 ADDON_dialog = xbmcgui.Dialog()
 ADDON_PlayerStyle = int(ADDON_object.getSetting('Duola_play_style'))
-ADDON_PlayerMimes = ['.m3u8', '.mp4', '.flv', '.ts', '.ogg', '.mp3']
+ADDON_PlayerMimes = ['.m3u8', '.mpd', '.mp4', '.flv', '.ts', '.mkv', '.avi', '.mov', '.ogg', '.mp3']
+ADDON_NonVideoMimes = ['.html', '.htm', '.php', '.asp', '.aspx', '.jsp', '.json', '.xml', '.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.txt']
+MIME_HLS = 'application/vnd.apple.mpegurl'
+MIME_DASH = 'application/dash+xml'
 
 # Get addon base path
 ADDON_path = xbmcvfs.translatePath(ADDON_object.getAddonInfo('path'))
@@ -218,12 +221,139 @@ def build_request_url(base, suffix=''):
     return base + '&' + suffix.lstrip('?')
 
 
+def url_media_path(url):
+    """取 URL 的 path：忽略 ?query、#fragment 与 Kodi 的 |header 后缀。"""
+    clean = (url or '').split('|', 1)[0]
+    try:
+        return urllib.parse.urlparse(clean).path.lower()
+    except Exception:
+        return clean.lower()
+
+
 def check_url_mime(url):
-    hz = '.' + url.split('.')[-1]
-    if hz in ADDON_PlayerMimes:
+    """v1.9: 按 path 判断，带 ?token= 也能识别；无后缀/间接播放 id 交给播放器。"""
+    name = url_media_path(url).rsplit('/', 1)[-1]
+    if any(name.endswith(ext) for ext in ADDON_PlayerMimes):
         return True
-    else:
+    if any(name.endswith(ext) for ext in ADDON_NonVideoMimes):
         return False
+    return bool(name)
+
+
+def get_url_media_type(url):
+    path = url_media_path(url)
+    if path.endswith('.m3u8'):
+        return 'hls'
+    if path.endswith('.mpd'):
+        return 'dash'
+    file_exts = tuple(ext for ext in ADDON_PlayerMimes if ext not in ('.m3u8', '.mpd'))
+    if file_exts and path.endswith(file_exts):
+        return 'file'
+    return 'unknown'
+
+
+def build_stream_headers(url):
+    """统一构造 header 文本，值做 URL 编码，adaptive 与直链 | 语法共用。"""
+    clean = (url or '').split('|', 1)[0]
+    try:
+        parsed = urllib.parse.urlparse(clean)
+    except Exception:
+        return ''
+    if not parsed.netloc:
+        return ''
+    ua = UA_head.get('User-Agent', '')
+    referer = parsed.scheme + '://' + parsed.netloc + '/'
+    origin = parsed.scheme + '://' + parsed.netloc
+    pairs = []
+    if ua:
+        pairs.append('User-Agent=' + urllib.parse.quote(ua, safe=''))
+    pairs.append('Referer=' + urllib.parse.quote(referer, safe=''))
+    pairs.append('Origin=' + urllib.parse.quote(origin, safe=''))
+    return '&'.join(pairs)
+
+
+def get_kodi_major():
+    try:
+        return int(str(xbmc.getInfoLabel('System.BuildVersion')).split('.')[0])
+    except Exception:
+        return 19
+
+
+def detect_inputstream_adaptive(addon_factory=None):
+    factory = addon_factory or xbmcaddon.Addon
+    try:
+        factory('inputstream.adaptive')
+        return True
+    except Exception:
+        return False
+
+
+def prepare_play_item(list_item, url, use_adaptive=None, major=None):
+    """v1.9: 统一设置 MIME / inputstream.adaptive / header，返回最终播放 URL。
+
+    HLS/DASH 且 adaptive 可用 -> manifest_type + stream_headers；
+    否则回退直链，在 URL 后拼 |User-Agent=...&Referer=...&Origin=...
+    """
+    original = url or ''
+    clean = original.split('|', 1)[0]
+    media = get_url_media_type(clean)
+    header_text = build_stream_headers(clean)
+    if use_adaptive is None:
+        use_adaptive = detect_inputstream_adaptive()
+    if major is None:
+        major = get_kodi_major()
+
+    try:
+        list_item.setContentLookup(False)
+        if media in ('hls', 'dash') and use_adaptive:
+            if major >= 19:
+                list_item.setProperty('inputstream', 'inputstream.adaptive')
+            else:
+                list_item.setProperty('inputstreamaddon', 'inputstream.adaptive')
+            list_item.setProperty('inputstream.adaptive.manifest_type', 'hls' if media == 'hls' else 'dash')
+            if header_text:
+                list_item.setProperty('inputstream.adaptive.stream_headers', header_text)
+            list_item.setMimeType(MIME_HLS if media == 'hls' else MIME_DASH)
+            return clean
+        if media == 'hls':
+            list_item.setMimeType(MIME_HLS)
+        elif media == 'dash':
+            list_item.setMimeType(MIME_DASH)
+        # mp4/flv 等不再强制 HLS MIME
+    except Exception as e:
+        print('duola_debug:prepare_play_item fallback=' + str(e))
+
+    if '|' in original:
+        return original
+    return clean + '|' + header_text if header_text else clean
+
+
+def parse_play_lines(video):
+    """v1.9: 按 vod_play_from + vod_play_url 构建线路模型，线路内只放本线路剧集。"""
+    flags = str(video.get('vod_play_from', '') or '').split('$$$')
+    urls = str(video.get('vod_play_url', '') or '').split('$$$')
+    lines = []
+    for index, raw_line in enumerate(urls):
+        episodes = []
+        for raw_ep in raw_line.split('#'):
+            if '$' not in raw_ep:
+                continue
+            name, ep_url = raw_ep.split('$', 1)
+            name, ep_url = name.strip(), ep_url.strip()
+            if not ep_url or not check_url_mime(ep_url):
+                continue
+            episodes.append({
+                'name': name or '第%d集' % (len(episodes) + 1),
+                'url': ep_url,
+            })
+        if not episodes:
+            continue
+        flag = flags[index].strip() if index < len(flags) else ''
+        lines.append({
+            'name': flag or '线路%d' % (index + 1),
+            'episodes': episodes,
+        })
+    return lines
 
 
 def remove_html_tags(html):
@@ -896,139 +1026,108 @@ def Web_load_detail_one(url, detail_id):
         ADDON_dialog.notification(heading=ADDON_name, message='内容获取失败，暂不可用', icon=xbmcgui.NOTIFICATION_WARNING, time=3000)
         return
 
-    resolved_url = None
     res_json = None
-    for candidate_url, _, candidate_json in detail_candidates:
+    for _, _, candidate_json in detail_candidates:
         if candidate_json and candidate_json.get('code') == 1 and candidate_json.get('list'):
-            resolved_url = candidate_url
             res_json = candidate_json
             break
-
-    if resolved_url is None or res_json is None:
+    if res_json is None:
         ADDON_dialog.notification(heading=ADDON_name, message='内容获取失败，暂不可用', icon=xbmcgui.NOTIFICATION_WARNING, time=3000)
         return
 
-    if res_json['code'] == 1:
-        if len(res_json['list']) > 0:
-            video = res_json['list'][0]  # 仅提取一个
-            v_id = str(video['vod_id'])
-            v_name = video['vod_name']
-            v_typename = video['type_name']
-            v_picture = video['vod_pic']
-            v_list_text = video['vod_play_url']  # 多地址合集
-            v_infos = {}
-            try:
-                v_infos['title'] = video['vod_name']
-                v_infos['originaltitle'] = video['vod_sub']
-                v_infos['sorttitle'] = video['vod_en']
-                v_infos['country'] = video['vod_area'].split(",")
-                v_infos['year'] = video['vod_year']
-                v_infos['director'] = video['vod_director']
-                v_infos['writer'] = video['vod_writer'].split(",")
-                v_infos['cast'] = video['vod_actor'].split(',')
-                v_infos['plotoutline'] = video['vod_blurb']
-                v_infos['plot'] = remove_html_tags(video['vod_content'])
-                v_infos['rating'] = float(video['vod_douban_score'])
-            except IndexError as e:
-                pass
-            # dialog.select
-            V_name_list = []
-            V_m3u8_list = []
-            playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
-            # 按$$$分隔不同的[播放来源]数据
-            # 01集$http://a.com/1.mp4#02集$http://a.com/2.mp4$$$01集$http://a.com/1.flv#02集$http://a.com/2.flv
-            V_class_data = v_list_text.split('$$$')
-            if len(V_class_data) > 0:
-                select_title = '请选择播放源开始播放【' + v_name + '】'
-                for V_list in V_class_data:
-                    # 按#分隔相同的[播放来源]数据中的不同[播放地址/剧集]
-                    # 第01集$http://abc.com/1.flv#第02集$http://abc.com/2.flv
-                    V_playlist = V_list.split('#')
-                    V_i = 0
-                    for V_play in V_playlist:
-                        # 按#分隔，将vod_title与vod_url区分
-                        # 第01集$http://abc.com/1.flv
-                        V = V_play.split('$')
-                        if len(V) == 2 and check_url_mime(V[1].strip()):
-                            _v_play_label = V[0].strip()  # 去除首尾空格
-                            _v_play_url = V[1].strip()  # 去除首尾空格
-                            # Build play URL with HTTP headers for CDN access
-                            if '|' not in _v_play_url:
-                                try:
-                                    _play_parsed = urllib.parse.urlparse(_v_play_url)
-                                    _referer = _play_parsed.scheme + '://' + _play_parsed.netloc + '/'
-                                except Exception:
-                                    _referer = ''
-                                if _referer:
-                                    _ua = UA_head.get('User-Agent', '')
-                                    _v_play_url = _v_play_url + '|Referer=' + _referer + '&User-Agent=' + urllib.parse.quote(_ua)
-                            V_name_list.append(_v_play_label)  # 播放标签
-                            V_m3u8_list.append(_v_play_url)  # 播放地址
-                            # listitem for player_style 2
-                            list_item = xbmcgui.ListItem(v_name + ': ' + _v_play_label, v_typename)
-                            list_item.setContentLookup(False)
-                            list_item.setMimeType('application/x-mpegURL')
-                            list_item.setArt({'thumb': v_picture, 'poster': v_picture})
-                            list_item.setInfo('video', v_infos)
-                            playlist.add(url=_v_play_url, listitem=list_item, index=V_i)
-                            V_i = V_i + 1
-                        else:
-                            pass  # 不符合条件的播放地址跳过
-            else:
-                select_title = '此视频暂时没有播放源'
-            # 播放方式
-            print('duola_debug: ADDON_PlayerStyle@' + str(ADDON_PlayerStyle))
-            # player_style -------------------------------------------------
-            if ADDON_PlayerStyle == 0:
-                a = -1
-                for x in V_name_list:
-                    a = a + 1
-                    list_item = xbmcgui.ListItem('[COLOR blue]【播放】[/COLOR]' + v_name + ' (' + x + ')')
-                    list_item.setContentLookup(False)
-                    list_item.setMimeType('application/x-mpegURL')
-                    list_item.setArt({'icon': os.path.join(ICONS_dir, 'play.png'), 'poster': v_picture})
-                    list_item.setInfo('video', v_infos)
-                    xbmcplugin.addDirectoryItem(ADDON_handle, V_m3u8_list[a], list_item, False)
-                xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=True)
-            # player_style -------------------------------------------------
-            if ADDON_PlayerStyle == 1:
-                select_i = ADDON_dialog.select(select_title, V_name_list)
-                print('duola_debug: select_i ' + str(select_i))
-                if select_i >= 0:
-                    list_item = xbmcgui.ListItem(v_name, v_typename, V_m3u8_list[select_i], offscreen=False)
-                    list_item.setContentLookup(False)
-                    list_item.setMimeType('application/x-mpegURL')
-                    list_item.setArt({'thumb': v_picture, 'poster': v_picture})
-                    list_item.setInfo('video', v_infos)
-                    # ADDON_dialog.info(list_item)  # 弹出视频
-                    xbmc.Player().play(item=V_m3u8_list[select_i], listitem=list_item)
-                    ADDON_dialog.notification(heading=ADDON_name, message='视频即将播放，请耐心稍候一会', time=6000, sound=False)
-                xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=True)
-            # player_style -------------------------------------------------
-            if ADDON_PlayerStyle == 2:
-                # dialog = xbmcgui.Dialog()
-                select_i = ADDON_dialog.select(select_title, V_name_list)
-                print('duola_debug: select_i ' + str(select_i))
-                if select_i >= 0:
-                    list_item = xbmcgui.ListItem(v_name, v_typename, V_m3u8_list[select_i], offscreen=False)
-                    list_item.setContentLookup(False)
-                    list_item.setMimeType('application/x-mpegURL')
-                    list_item.setArt({'thumb': v_picture, 'poster': v_picture})
-                    list_item.setInfo('video', v_infos)
-                    xbmc.Player().play(item=playlist, listitem=list_item, windowed=False, startpos=select_i)
-                    ADDON_dialog.notification(heading=ADDON_name, message='视频即将播放，请耐心稍候一会', time=6000, sound=False)
-                xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=True)
-        else:
-            print('duola_debug:没有数据')
-            ADDON_dialog.notification(heading=ADDON_name, message='抱歉，找不到播放列表', time=3000)
-    else:
-        print('duola_debug:无法解析json')
-        ADDON_dialog.notification(
-            heading=ADDON_name,
-            message='抱歉，由于无法解析返回的数据，服务暂时不可用，请稍后重试',
-            icon=xbmcgui.NOTIFICATION_WARNING,
-            time=3000
-        )
+    video = res_json['list'][0]
+    v_name = str(video.get('vod_name', ''))
+    v_typename = str(video.get('type_name', ''))
+    v_picture = str(video.get('vod_pic', ''))
+    v_infos = {}
+    try:
+        v_infos['title'] = video['vod_name']
+        v_infos['originaltitle'] = video['vod_sub']
+        v_infos['sorttitle'] = video['vod_en']
+        v_infos['country'] = video['vod_area'].split(',')
+        v_infos['year'] = video['vod_year']
+        v_infos['director'] = video['vod_director']
+        v_infos['writer'] = video['vod_writer'].split(',')
+        v_infos['cast'] = video['vod_actor'].split(',')
+        v_infos['plotoutline'] = video['vod_blurb']
+        v_infos['plot'] = remove_html_tags(video['vod_content'])
+        v_infos['rating'] = float(video['vod_douban_score'])
+    except (IndexError, KeyError, ValueError, TypeError):
+        pass
+
+    lines = parse_play_lines(video)
+    if not lines:
+        ADDON_dialog.notification(heading=ADDON_name, message='抱歉，找不到播放列表', time=3000)
+        xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=True)
+        return
+
+    # v1.9: 多线路先选线路，单线路自动跳过
+    line_index = 0
+    if len(lines) > 1:
+        line_index = ADDON_dialog.select('选择播放源【' + v_name + '】', [line['name'] for line in lines])
+        if line_index < 0:
+            xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=True)
+            return
+    line_name = lines[line_index]['name']
+    episodes = lines[line_index]['episodes']
+    select_title = '请选择剧集开始播放【' + v_name + ' / ' + line_name + '】'
+    print('duola_debug: lines=' + str(len(lines)) + ' picked=' + line_name + ' episodes=' + str(len(episodes)) + ' style=' + str(ADDON_PlayerStyle))
+
+    adaptive = detect_inputstream_adaptive()
+    major = get_kodi_major()
+
+    def make_item(label, icon=None):
+        item = xbmcgui.ListItem(label, v_typename)
+        art = {'thumb': v_picture, 'poster': v_picture}
+        if icon:
+            art['icon'] = icon
+        item.setArt(art)
+        item.setInfo('video', v_infos)
+        return item
+
+    def finish_directory():
+        xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=True)
+
+    # player_style 0：列出当前线路的所有剧集
+    if ADDON_PlayerStyle == 0:
+        for ep in episodes:
+            item = make_item('[COLOR blue]【播放】[/COLOR]' + v_name + ' (' + ep['name'] + ')', os.path.join(ICONS_dir, 'play.png'))
+            final_url = prepare_play_item(item, ep['url'], use_adaptive=adaptive, major=major)
+            xbmcplugin.addDirectoryItem(ADDON_handle, final_url, item, False)
+        finish_directory()
+        return
+
+    select_i = ADDON_dialog.select(select_title, [ep['name'] for ep in episodes])
+    print('duola_debug: select_i ' + str(select_i))
+    if select_i < 0:
+        finish_directory()
+        return
+
+    # player_style 1：只播当前线路的选中集
+    if ADDON_PlayerStyle == 1:
+        item = make_item(v_name + ': ' + episodes[select_i]['name'])
+        final_url = prepare_play_item(item, episodes[select_i]['url'], use_adaptive=adaptive, major=major)
+        xbmc.Player().play(item=final_url, listitem=item)
+        ADDON_dialog.notification(heading=ADDON_name, message='视频即将播放，请耐心稍候一会', time=6000, sound=False)
+        finish_directory()
+        return
+
+    # player_style 2：播放列表只包含当前线路，连播不再跨线路错集
+    playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
+    try:
+        playlist.clear()
+    except Exception:
+        pass
+    selected_item = None
+    for index, ep in enumerate(episodes):
+        item = make_item(v_name + ': ' + ep['name'])
+        final_url = prepare_play_item(item, ep['url'], use_adaptive=adaptive, major=major)
+        playlist.add(url=final_url, listitem=item, index=index)
+        if index == select_i:
+            selected_item = item
+    xbmc.Player().play(item=playlist, listitem=selected_item, windowed=False, startpos=select_i)
+    ADDON_dialog.notification(heading=ADDON_name, message='视频即将播放，请耐心稍候一会', time=6000, sound=False)
+    finish_directory()
 
 
 # request: https://123.com/api/provide/vod/?ac=list
@@ -1294,6 +1393,8 @@ if '?Bot_help' in ADDON_parm:
     help_text += '\n插件声明：\n本插件是基于学习和研究目的通过爬虫技术所抓取的所有内容均来自于第三方网站的数据，插件不涉及资源存储或分发。'
     help_text += '作者不对其内容承担任何责任！仅供个人学习交流之用，24小时内请自觉卸载，勿作商业用途。'
     ADDON_dialog.ok(ADDON_name + ' 帮助&声明', help_text)
+    # 纯弹窗分支也要结束目录，否则 Kodi 会记 GetDirectory 失败并退回上级
+    xbmcplugin.endOfDirectory(handle=ADDON_handle, succeeded=True, updateListing=False, cacheToDisc=False)
 
 # /?Bot_engine=https%3A%2F%2F123.com%2Fapi%2Fprovide%2Fvod%2F :: 云引擎
 if '?Bot_engine=' in ADDON_parm:
